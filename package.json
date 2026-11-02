@@ -1,0 +1,40 @@
+{
+  "name": "soma-slice-automation",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently \"next dev --hostname 127.0.0.1\" \"tsx --watch src/worker/index.ts\"",
+    "build": "rm -rf .next && next build",
+    "start": "next start --hostname 127.0.0.1",
+    "worker": "tsx src/worker/index.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "phase0:rest": "tsx scripts/test-rest.ts",
+    "phase0:mcp": "tsx scripts/test-mcp.ts",
+    "phase0:mcp-full": "tsx scripts/mcp-phase0.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.3.0",
+    "@higgsfield/client": "latest",
+    "better-sqlite3": "13.0.3",
+    "dotenv": "^16.5.0",
+    "drizzle-orm": "0.36.0",
+    "next": "^15.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "9.6.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "concurrently": "^9.0.0",
+    "drizzle-kit": "0.27.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "better-sqlite3@13.0.3": true
+  }
+}

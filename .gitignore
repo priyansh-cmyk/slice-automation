@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env.local
+data/
+storage/
+scripts/output/
+*.db
+*.db-shm
+*.db-wal
+.next/
+next-env.d.ts

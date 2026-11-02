@@ -1,0 +1,41 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1793521962024,
+      "tag": "0000_condemned_sprite",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1793525422871,
+      "tag": "0001_misty_giant_man",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1793548092011,
+      "tag": "0002_nasty_scourge",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1793555408412,
+      "tag": "0003_flippant_robbie_robertson",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1793602982475,
+      "tag": "0004_military_phantom_reporter",
+      "breakpoints": true
+    }
+  ]
+}
