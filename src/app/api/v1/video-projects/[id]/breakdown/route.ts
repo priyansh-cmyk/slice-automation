@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/db';
-import { videoProjects, videoScreens } from '@/db/schema';
+import { videoProjects, videoScreens } from '@/db/schema.pg';
+import { createClient } from '@/lib/supabase/server';
 import { eq } from 'drizzle-orm';
 
-// PUT /api/v1/video-projects/[id]/breakdown - overwrite screens, clears breakdownApprovedAt
 export async function PUT(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
@@ -12,13 +12,12 @@ export async function PUT(
   const projectId = parseInt(id, 10);
   if (isNaN(projectId)) return NextResponse.json({ error: 'Invalid id' }, { status: 400 });
 
-  const project = db
-    .select()
-    .from(videoProjects)
-    .where(eq(videoProjects.id, projectId))
-    .limit(1)
-    .get();
-  if (!project) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const projectRows = await db.select().from(videoProjects).where(eq(videoProjects.id, projectId)).limit(1);
+  if (!projectRows[0]) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
   const body = (await req.json()) as {
     screens: Array<{ screenNumber: number; dialogue: string; position?: number; durationSeconds?: number | null; durationNote?: string | null }>;
@@ -31,37 +30,31 @@ export async function PUT(
 
   const now = Date.now();
 
-  db.delete(videoScreens).where(eq(videoScreens.videoProjectId, projectId)).run();
-  db.update(videoProjects)
+  await db.delete(videoScreens).where(eq(videoScreens.videoProjectId, projectId));
+  await db
+    .update(videoProjects)
     .set({
       breakdownApprovedAt: null,
       updatedAt: now,
       ...(body.approvedScript !== undefined ? { approvedScript: body.approvedScript } : {}),
     })
-    .where(eq(videoProjects.id, projectId))
-    .run();
+    .where(eq(videoProjects.id, projectId));
 
   for (const s of body.screens) {
-    db.insert(videoScreens)
-      .values({
-        videoProjectId: projectId,
-        screenNumber: s.screenNumber,
-        dialogue: s.dialogue,
-        position: s.position ?? s.screenNumber,
-        durationSeconds: s.durationSeconds ?? null,
-        durationNote: s.durationNote ?? null,
-        createdAt: now,
-        updatedAt: now,
-      })
-      .run();
+    await db.insert(videoScreens).values({
+      videoProjectId: projectId,
+      screenNumber: s.screenNumber,
+      dialogue: s.dialogue,
+      position: s.position ?? s.screenNumber,
+      durationSeconds: s.durationSeconds ?? null,
+      durationNote: s.durationNote ?? null,
+      createdAt: now,
+      updatedAt: now,
+    });
   }
 
-  const screens = db
-    .select()
-    .from(videoScreens)
-    .where(eq(videoScreens.videoProjectId, projectId))
-    .all()
-    .sort((a, b) => a.position - b.position);
+  const allScreens = await db.select().from(videoScreens).where(eq(videoScreens.videoProjectId, projectId));
+  const screens = allScreens.sort((a, b) => a.position - b.position);
 
   return NextResponse.json({ screens });
 }

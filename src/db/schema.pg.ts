@@ -108,6 +108,7 @@ export const videoGenerations = pgTable('video_generations', {
   durationSeconds: integer('duration_seconds'),
   errorMessage: text('error_message'),
   creatorFeedback: text('creator_feedback'),
+  claimedAt: bigint('claimed_at', { mode: 'number' }),      // lease timestamp; null = unclaimed
   createdAt: bigint('created_at', { mode: 'number' }).notNull(),
   updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
 });

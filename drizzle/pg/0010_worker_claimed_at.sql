@@ -9,6 +9,10 @@ ALTER TABLE prompt_generation_tasks
 ALTER TABLE video_compilations
   ADD COLUMN IF NOT EXISTS claimed_at BIGINT;
 
--- Add index if not already present (idempotent)
+ALTER TABLE video_generations
+  ADD COLUMN IF NOT EXISTS claimed_at BIGINT;
+
+-- Add indexes if not already present (idempotent)
 CREATE INDEX IF NOT EXISTS idx_pgt_claimed_at ON prompt_generation_tasks(claimed_at);
 CREATE INDEX IF NOT EXISTS idx_vc_claimed_at ON video_compilations(claimed_at);
+CREATE INDEX IF NOT EXISTS idx_vg_claimed_at ON video_generations(claimed_at);

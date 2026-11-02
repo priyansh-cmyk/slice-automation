@@ -5,15 +5,16 @@ import {
   screenPromptVersions,
   videoGenerations,
   promptGenerationTasks,
-} from '@/db/schema';
+} from '@/db/schema.pg';
 import { eq, max } from 'drizzle-orm';
-import { callClaude, encodeImageFromPath, loadConversation } from './anthropic';
+import { callClaude, encodeImageFromStorage, loadConversation } from './anthropic';
 import { getSkillContent } from '@/lib/ugc-skill';
 import { useapiProvider } from '@/providers/useapi/provider';
 import type { VideoGenerationProvider } from '@/providers/useapi/interface';
 
 const DEFAULT_MODEL = () => process.env.VIDEO_DEFAULT_MODEL ?? 'omni-flash';
 const DEFAULT_DURATION = () => parseInt(process.env.VIDEO_DEFAULT_DURATION ?? '8', 10);
+const UPLOADS_BUCKET = () => process.env.SUPABASE_BUCKET_UPLOADS ?? 'uploads';
 
 // ── Creative Brief ────────────────────────────────────────────────────────────
 
@@ -34,7 +35,6 @@ export function parseBrief(creativeBriefJson: string | null | undefined): Creati
     return {};
   }
 }
-
 
 function detectFeedbackScope(feedback: string): 'project' | 'scene' {
   const projectIndicators =
@@ -58,7 +58,6 @@ export function validatePrompt(
   const issues: string[] = [];
   const warnings: string[] = [];
 
-  // 1. Dialogue present check (compare first 30 chars for robustness)
   const normalizedDialogue = dialogue.trim().replace(/['"''""]/g, '').toLowerCase();
   const normalizedPrompt = promptText.toLowerCase().replace(/['"''""]/g, '');
   if (normalizedDialogue.length > 10) {
@@ -68,7 +67,6 @@ export function validatePrompt(
     }
   }
 
-  // 2. Timing estimate
   if (durationSeconds) {
     const wordCount = dialogue.trim().split(/\s+/).filter(Boolean).length;
     const DURATION_RANGES: Record<number, [number, number]> = {
@@ -88,13 +86,11 @@ export function validatePrompt(
     }
   }
 
-  // 3. Excessive word-by-word choreography
   const choreographyMatches = promptText.match(/on the word|as (she|he|they) says|when (she|he|they) says|at the word/gi);
   if ((choreographyMatches?.length ?? 0) > 2) {
     warnings.push('Expression section contains detailed word-by-word choreography. Consider simplifying.');
   }
 
-  // 4. Contradictory directions
   const contradictionPairs: [RegExp, RegExp][] = [
     [/whisper|whispered|intimate/i, /projecting|loud(ly)?|shout/i],
     [/close.up|tight.shot|close.crop/i, /wide.shot|full.body|wide.frame/i],
@@ -106,7 +102,6 @@ export function validatePrompt(
     }
   }
 
-  // 5. Missing Audio section
   if (brief?.voiceIdentity && !promptText.toLowerCase().includes('audio')) {
     warnings.push('Prompt appears to be missing an Audio section.');
   }
@@ -116,9 +111,6 @@ export function validatePrompt(
 
 // ── Script Analysis ──────────────────────────────────────────────────────────
 
-// Duration guidance aligned with the UGC skill (v2): word-count based estimates.
-// 4s: 10-15 words | 6s: 18-24 words | 8s: 28-36 words | 10s: 38-50 words
-// For Hinglish/bilingual, add 10-15%. When two durations fit, choose the longer one.
 const ANALYSIS_SYSTEM_PROMPT = `You break UGC ad scripts into individual scenes for video production.
 
 Rules:
@@ -155,17 +147,15 @@ export async function analyzeScript(videoProjectId: number): Promise<{
   screens: Array<{ screenNumber: number; dialogue: string; durationSeconds: number; durationNote?: string }>;
   possibleTypos: TypoCandidate[];
 }> {
-  const project = db
+  const rows = await db
     .select()
     .from(videoProjects)
     .where(eq(videoProjects.id, videoProjectId))
-    .limit(1)
-    .get();
+    .limit(1);
+  const project = rows[0];
   if (!project) throw new Error(`Video project ${videoProjectId} not found`);
 
   const userMessage = `Script:\n${project.approvedScript ?? project.originalScript}`;
-
-  // Use fresh call (no conversation history) - analysis is standalone
   const response = await callClaude(videoProjectId, userMessage, ANALYSIS_SYSTEM_PROMPT, { fresh: true });
 
   const jsonMatch = response.match(/\{[\s\S]*\}/);
@@ -204,17 +194,16 @@ export async function extractAndStoreCreativeBrief(
   approvedPromptText: string,
   screen1Id?: number,
 ): Promise<CreativeBrief> {
-  const project = db
+  const rows = await db
     .select()
     .from(videoProjects)
     .where(eq(videoProjects.id, videoProjectId))
-    .limit(1)
-    .get();
+    .limit(1);
+  const project = rows[0];
   if (!project) throw new Error(`Project ${videoProjectId} not found`);
 
   const existingBrief = parseBrief(project.creativeBrief);
 
-  // Load Screen 1 conversation history to capture the full calibration process
   let calibrationContext = '';
   if (screen1Id) {
     const history = await loadConversation(videoProjectId, screen1Id);
@@ -262,18 +251,16 @@ export async function extractAndStoreCreativeBrief(
     setting: (extracted.setting as string | undefined) ?? undefined,
   };
 
-  db.update(videoProjects)
+  await db
+    .update(videoProjects)
     .set({ creativeBrief: JSON.stringify(mergedBrief), updatedAt: Date.now() })
-    .where(eq(videoProjects.id, videoProjectId))
-    .run();
+    .where(eq(videoProjects.id, videoProjectId));
 
   return mergedBrief;
 }
 
 // ── Creative Direction Helpers ────────────────────────────────────────────────
 
-// Google Flow is stateless — each API call is independent with no memory of prior requests.
-// This instruction overrides the UGC skill's "Same character." shorthand for scenes 2+.
 const SELF_CONTAINED_PROMPT_INSTRUCTION =
   `\n\nCRITICAL — Google Flow receives each scene as an isolated API call with zero memory of previous requests. Every scene 2+ prompt MUST be fully self-contained:\n` +
   `- Character section: write the complete character description from the established creative direction above. NEVER write "Same character." — Google Flow does not know what that refers to.\n` +
@@ -282,7 +269,6 @@ const SELF_CONTAINED_PROMPT_INSTRUCTION =
 
 function buildCreativeDirectionBlock(brief: CreativeBrief, screen1PromptText: string | null): string {
   const parts: string[] = [];
-
   if (brief.voiceIdentity) parts.push(`Voice: ${brief.voiceIdentity}`);
   if (brief.performanceStyle) parts.push(`Performance: ${brief.performanceStyle}`);
   if (brief.gestureIntensity) parts.push(`Gesture intensity: ${brief.gestureIntensity}`);
@@ -299,29 +285,28 @@ function buildCreativeDirectionBlock(brief: CreativeBrief, screen1PromptText: st
   return block;
 }
 
-function getScreen1ApprovedPromptInfo(videoProjectId: number): { promptText: string; versionId: number } | null {
-  const screen1 = db
+async function getScreen1ApprovedPromptInfo(videoProjectId: number): Promise<{ promptText: string; versionId: number } | null> {
+  const allScreens = await db
     .select()
     .from(videoScreens)
-    .where(eq(videoScreens.videoProjectId, videoProjectId))
-    .all()
-    .find((s) => s.screenNumber === 1);
+    .where(eq(videoScreens.videoProjectId, videoProjectId));
+  const screen1 = allScreens.find((s) => s.screenNumber === 1);
   if (!screen1?.approvedGenerationId) return null;
 
-  const approvedGen = db
+  const genRows = await db
     .select()
     .from(videoGenerations)
     .where(eq(videoGenerations.id, screen1.approvedGenerationId))
-    .limit(1)
-    .get();
+    .limit(1);
+  const approvedGen = genRows[0];
   if (!approvedGen) return null;
 
-  const promptVersion = db
+  const pvRows = await db
     .select()
     .from(screenPromptVersions)
     .where(eq(screenPromptVersions.id, approvedGen.promptVersionId))
-    .limit(1)
-    .get();
+    .limit(1);
+  const promptVersion = pvRows[0];
   if (!promptVersion) return null;
   return { promptText: promptVersion.promptText, versionId: promptVersion.id };
 }
@@ -334,25 +319,18 @@ export async function generateScreen1Prompt(
   nlFeedback?: string,
   reviewingGenerationId?: number,
 ): Promise<{ promptText: string; version: number; validation: ValidationResult; feedbackScope?: string }> {
-  const screen = db
-    .select()
-    .from(videoScreens)
-    .where(eq(videoScreens.id, videoScreenId))
-    .limit(1)
-    .get();
+  const [screenRows, projectRows] = await Promise.all([
+    db.select().from(videoScreens).where(eq(videoScreens.id, videoScreenId)).limit(1),
+    db.select().from(videoProjects).where(eq(videoProjects.id, videoProjectId)).limit(1),
+  ]);
+  const screen = screenRows[0];
+  const project = projectRows[0];
   if (!screen) throw new Error(`Screen ${videoScreenId} not found`);
-
-  const project = db
-    .select()
-    .from(videoProjects)
-    .where(eq(videoProjects.id, videoProjectId))
-    .limit(1)
-    .get();
   if (!project) throw new Error(`Video project ${videoProjectId} not found`);
 
   const skillContent = getSkillContent(project.skillVersion);
   const brief = parseBrief(project.creativeBrief);
-  const image = encodeImageFromPath(project.baseImagePath);
+  const image = await encodeImageFromStorage(project.baseImagePath, UPLOADS_BUCKET());
 
   let userMessage: string;
   let feedbackScope: string | undefined;
@@ -360,12 +338,11 @@ export async function generateScreen1Prompt(
   if (nlFeedback) {
     feedbackScope = detectFeedbackScope(nlFeedback);
 
-    const latestVersion = db
+    const allVersions = await db
       .select()
       .from(screenPromptVersions)
-      .where(eq(screenPromptVersions.videoScreenId, videoScreenId))
-      .all()
-      .sort((a, b) => b.version - a.version)[0];
+      .where(eq(screenPromptVersions.videoScreenId, videoScreenId));
+    const latestVersion = allVersions.sort((a, b) => b.version - a.version)[0];
 
     userMessage =
       `Revise the Scene 1 prompt based on this feedback: ${nlFeedback}\n\n` +
@@ -375,14 +352,19 @@ export async function generateScreen1Prompt(
       (latestVersion ? `\n\nCurrent prompt:\n${latestVersion.promptText}` : '');
 
     if (reviewingGenerationId) {
-      db.update(videoGenerations)
+      await db
+        .update(videoGenerations)
         .set({ creatorFeedback: nlFeedback, updatedAt: Date.now() })
-        .where(eq(videoGenerations.id, reviewingGenerationId))
-        .run();
+        .where(eq(videoGenerations.id, reviewingGenerationId));
     }
   } else {
     const creatorDescPart = project.creatorDescription
       ? `\n\nCreator description: ${project.creatorDescription}`
+      : '';
+
+    // Inject scene1 hook snapshot if available (lower-priority creative seed)
+    const hookBlock = project.scene1HookSnapshot
+      ? `\n\n[SCENE 1 HOOK — DEFAULT STARTING DIRECTION]\nThis is a creative seed. Apply it to dimensions not addressed by feedback below. If you have prior revision feedback, that takes priority.\n${project.scene1HookSnapshot}`
       : '';
 
     userMessage =
@@ -392,6 +374,7 @@ export async function generateScreen1Prompt(
       `\nReturn only the formatted scene prompt. Do not include scene breakdown, analysis, or content for other scenes.` +
       `\nPreserve the original dialogue exactly.` +
       creatorDescPart +
+      hookBlock +
       `\n\nFull script:\n${project.approvedScript ?? project.originalScript}` +
       `\n\nScene 1 dialogue: "${screen.dialogue}"` +
       (screen.durationSeconds ? `\nTarget duration: ${screen.durationSeconds} seconds` : '');
@@ -408,26 +391,19 @@ export async function generateInitialScreenPrompt(
   videoProjectId: number,
   videoScreenId: number,
 ): Promise<{ promptText: string; version: number; validation: ValidationResult }> {
-  const screen = db
-    .select()
-    .from(videoScreens)
-    .where(eq(videoScreens.id, videoScreenId))
-    .limit(1)
-    .get();
+  const [screenRows, projectRows] = await Promise.all([
+    db.select().from(videoScreens).where(eq(videoScreens.id, videoScreenId)).limit(1),
+    db.select().from(videoProjects).where(eq(videoProjects.id, videoProjectId)).limit(1),
+  ]);
+  const screen = screenRows[0];
+  const project = projectRows[0];
   if (!screen) throw new Error(`Screen ${videoScreenId} not found`);
-
-  const project = db
-    .select()
-    .from(videoProjects)
-    .where(eq(videoProjects.id, videoProjectId))
-    .limit(1)
-    .get();
   if (!project) throw new Error(`Video project ${videoProjectId} not found`);
 
   const skillContent = getSkillContent(project.skillVersion);
   const brief = parseBrief(project.creativeBrief);
-  const image = encodeImageFromPath(project.baseImagePath);
-  const screen1Info = getScreen1ApprovedPromptInfo(videoProjectId);
+  const image = await encodeImageFromStorage(project.baseImagePath, UPLOADS_BUCKET());
+  const screen1Info = await getScreen1ApprovedPromptInfo(videoProjectId);
   const creativeDirectionBlock = buildCreativeDirectionBlock(brief, screen1Info?.promptText ?? null);
 
   const userMessage =
@@ -454,26 +430,20 @@ export async function generateInitialScreenPrompt(
 export async function generateRemainingPrompts(
   videoProjectId: number,
 ): Promise<Array<{ videoScreenId: number; promptText: string; version: number }>> {
-  const screens = db
+  const allScreens = await db
     .select()
     .from(videoScreens)
-    .where(eq(videoScreens.videoProjectId, videoProjectId))
-    .all()
-    .filter((s) => s.screenNumber > 1)
-    .sort((a, b) => a.position - b.position);
+    .where(eq(videoScreens.videoProjectId, videoProjectId));
+  const screens = allScreens.filter((s) => s.screenNumber > 1).sort((a, b) => a.position - b.position);
 
-  const project = db
-    .select()
-    .from(videoProjects)
-    .where(eq(videoProjects.id, videoProjectId))
-    .limit(1)
-    .get();
+  const projectRows = await db.select().from(videoProjects).where(eq(videoProjects.id, videoProjectId)).limit(1);
+  const project = projectRows[0];
   if (!project) throw new Error(`Video project ${videoProjectId} not found`);
 
   const skillContent = getSkillContent(project.skillVersion);
   const brief = parseBrief(project.creativeBrief);
-  const image = encodeImageFromPath(project.baseImagePath);
-  const screen1Info = getScreen1ApprovedPromptInfo(videoProjectId);
+  const image = await encodeImageFromStorage(project.baseImagePath, UPLOADS_BUCKET());
+  const screen1Info = await getScreen1ApprovedPromptInfo(videoProjectId);
   const creativeDirectionBlock = buildCreativeDirectionBlock(brief, screen1Info?.promptText ?? null);
 
   const results: Array<{ videoScreenId: number; promptText: string; version: number }> = [];
@@ -510,37 +480,29 @@ export async function revisePrompt(
   nlFeedback: string,
   reviewingGenerationId?: number,
 ): Promise<{ promptText: string; version: number; validation: ValidationResult; feedbackScope: string }> {
-  const screen = db
-    .select()
-    .from(videoScreens)
-    .where(eq(videoScreens.id, videoScreenId))
-    .limit(1)
-    .get();
+  const [screenRows, projectRows] = await Promise.all([
+    db.select().from(videoScreens).where(eq(videoScreens.id, videoScreenId)).limit(1),
+    db.select().from(videoProjects).where(eq(videoProjects.id, videoProjectId)).limit(1),
+  ]);
+  const screen = screenRows[0];
+  const project = projectRows[0];
   if (!screen) throw new Error(`Screen ${videoScreenId} not found`);
-
-  const project = db
-    .select()
-    .from(videoProjects)
-    .where(eq(videoProjects.id, videoProjectId))
-    .limit(1)
-    .get();
   if (!project) throw new Error(`Video project ${videoProjectId} not found`);
 
   const skillContent = getSkillContent(project.skillVersion);
   const brief = parseBrief(project.creativeBrief);
   const feedbackScope = detectFeedbackScope(nlFeedback);
-  const image = encodeImageFromPath(project.baseImagePath);
+  const image = await encodeImageFromStorage(project.baseImagePath, UPLOADS_BUCKET());
 
-  const latestVersion = db
+  const allVersions = await db
     .select()
     .from(screenPromptVersions)
-    .where(eq(screenPromptVersions.videoScreenId, videoScreenId))
-    .all()
-    .sort((a, b) => b.version - a.version)[0];
+    .where(eq(screenPromptVersions.videoScreenId, videoScreenId));
+  const latestVersion = allVersions.sort((a, b) => b.version - a.version)[0];
 
-  // For screens 2+, include established creative direction as a reminder
+  const screen1Info = screen.screenNumber > 1 ? await getScreen1ApprovedPromptInfo(videoProjectId) : null;
   const creativeDirectionBlock = screen.screenNumber > 1
-    ? buildCreativeDirectionBlock(brief, getScreen1ApprovedPromptInfo(videoProjectId)?.promptText ?? null)
+    ? buildCreativeDirectionBlock(brief, screen1Info?.promptText ?? null)
     : '';
 
   const userMessage =
@@ -552,16 +514,14 @@ export async function revisePrompt(
     (screen.screenNumber > 1 ? SELF_CONTAINED_PROMPT_INSTRUCTION : '') +
     (latestVersion ? `\n\nCurrent prompt:\n${latestVersion.promptText}` : '');
 
-  // Save feedback against the generation being reviewed
   if (reviewingGenerationId) {
-    db.update(videoGenerations)
+    await db
+      .update(videoGenerations)
       .set({ creatorFeedback: nlFeedback, updatedAt: Date.now() })
-      .where(eq(videoGenerations.id, reviewingGenerationId))
-      .run();
+      .where(eq(videoGenerations.id, reviewingGenerationId));
   }
 
   const promptText = await callClaude(videoProjectId, userMessage, skillContent, { videoScreenId, image });
-  const screen1Info = screen.screenNumber > 1 ? getScreen1ApprovedPromptInfo(videoProjectId) : null;
   const version = await insertPromptVersion(
     videoScreenId, promptText, 'claude', nlFeedback, feedbackScope,
     screen1Info?.versionId ?? null,
@@ -574,44 +534,38 @@ export async function revisePrompt(
 
 // ── Async Prompt Generation Task Queueing ─────────────────────────────────────
 
-export function enqueueScreen1ApprovalTasks(
+export async function enqueueScreen1ApprovalTasks(
   videoProjectId: number,
   screen1Id: number,
-): { tasksQueued: number } {
+): Promise<{ tasksQueued: number }> {
   const now = Date.now();
 
-  // Task 1: extract creative brief (must run before generate_prompt tasks)
-  db.insert(promptGenerationTasks)
-    .values({
-      videoProjectId,
-      videoScreenId: screen1Id,   // used to load S1 conversation history
-      taskType: 'extract_brief',
-      status: 'pending',
-      createdAt: now,
-      updatedAt: now,
-    })
-    .run();
+  await db.insert(promptGenerationTasks).values({
+    videoProjectId,
+    videoScreenId: screen1Id,
+    taskType: 'extract_brief',
+    status: 'pending',
+    createdAt: now,
+    updatedAt: now,
+  });
 
-  // Tasks 2..N: generate prompts for each remaining screen
-  const remainingScreens = db
+  const allScreens = await db
     .select()
     .from(videoScreens)
-    .where(eq(videoScreens.videoProjectId, videoProjectId))
-    .all()
+    .where(eq(videoScreens.videoProjectId, videoProjectId));
+  const remainingScreens = allScreens
     .filter((s) => s.screenNumber > 1)
     .sort((a, b) => a.position - b.position);
 
   for (const screen of remainingScreens) {
-    db.insert(promptGenerationTasks)
-      .values({
-        videoProjectId,
-        videoScreenId: screen.id,
-        taskType: 'generate_prompt',
-        status: 'pending',
-        createdAt: now + 1, // ensure extract_brief sorts first
-        updatedAt: now + 1,
-      })
-      .run();
+    await db.insert(promptGenerationTasks).values({
+      videoProjectId,
+      videoScreenId: screen.id,
+      taskType: 'generate_prompt',
+      status: 'pending',
+      createdAt: now + 1,
+      updatedAt: now + 1,
+    });
   }
 
   return { tasksQueued: 1 + remainingScreens.length };
@@ -623,46 +577,43 @@ export async function submitQueuedGeneration(
   generationId: number,
   provider: VideoGenerationProvider = useapiProvider,
 ): Promise<void> {
-  const gen = db
+  const genRows = await db
     .select()
     .from(videoGenerations)
     .where(eq(videoGenerations.id, generationId))
-    .limit(1)
-    .get();
+    .limit(1);
+  const gen = genRows[0];
   if (!gen || gen.status !== 'queued') return;
 
-  const screen = db
+  const screenRows = await db
     .select()
     .from(videoScreens)
     .where(eq(videoScreens.id, gen.videoScreenId))
-    .limit(1)
-    .get();
-  const project = screen
-    ? db.select().from(videoProjects).where(eq(videoProjects.id, screen.videoProjectId)).limit(1).get()
-    : null;
-  const promptVersion = db
-    .select()
-    .from(screenPromptVersions)
-    .where(eq(screenPromptVersions.id, gen.promptVersionId))
-    .limit(1)
-    .get();
+    .limit(1);
+  const screen = screenRows[0];
+
+  const [projectRows, pvRows] = await Promise.all([
+    screen ? db.select().from(videoProjects).where(eq(videoProjects.id, screen.videoProjectId)).limit(1) : Promise.resolve([]),
+    db.select().from(screenPromptVersions).where(eq(screenPromptVersions.id, gen.promptVersionId)).limit(1),
+  ]);
+  const project = (projectRows as typeof projectRows)[0];
+  const promptVersion = pvRows[0];
 
   if (!screen || !project || !promptVersion) {
-    db.update(videoGenerations)
+    await db
+      .update(videoGenerations)
       .set({ status: 'failed', errorMessage: 'Missing related records', updatedAt: Date.now() })
-      .where(eq(videoGenerations.id, generationId))
-      .run();
+      .where(eq(videoGenerations.id, generationId));
     return;
   }
 
   const duration = gen.durationSeconds ?? screen.durationSeconds ?? DEFAULT_DURATION();
   const now = Date.now();
 
-  // Mark as processing so the worker doesn't pick it up twice
-  db.update(videoGenerations)
+  await db
+    .update(videoGenerations)
     .set({ status: 'processing', updatedAt: now })
-    .where(eq(videoGenerations.id, generationId))
-    .run();
+    .where(eq(videoGenerations.id, generationId));
 
   try {
     let referenceImageMediaId = project.baseImageMediaId;
@@ -677,21 +628,19 @@ export async function submitQueuedGeneration(
         });
         referenceImageMediaId = uploaded.mediaGenerationId ?? null;
         if (referenceImageMediaId) {
-          db.update(videoProjects)
+          await db
+            .update(videoProjects)
             .set({ baseImageMediaId: referenceImageMediaId, updatedAt: now })
-            .where(eq(videoProjects.id, project.id))
-            .run();
+            .where(eq(videoProjects.id, project.id));
         }
       }
     }
 
-    let jobId: string | undefined;
     if (process.env.MOCK_USEAPI === 'true') {
-      jobId = `mock-job-${now}`;
-      db.update(videoGenerations)
-        .set({ jobId, status: 'completed', updatedAt: now })
-        .where(eq(videoGenerations.id, generationId))
-        .run();
+      await db
+        .update(videoGenerations)
+        .set({ jobId: `mock-job-${now}`, status: 'completed', updatedAt: now })
+        .where(eq(videoGenerations.id, generationId));
       return;
     }
 
@@ -703,44 +652,45 @@ export async function submitQueuedGeneration(
       aspectRatio: 'portrait',
       correlationId: `screen-${gen.videoScreenId}-v${gen.promptVersionId}-q`,
     });
-    jobId = result.jobId;
 
     if (result.videoUrl) {
       const downloaded = await provider.downloadVideo({
-        jobId,
+        jobId: result.jobId,
         signedUrl: result.videoUrl,
         outputMediaGenerationId: result.mediaGenerationId ?? null,
         jobCompletedAt: now,
       });
-      db.update(videoGenerations)
-        .set({ jobId, status: 'completed', videoLocalPath: downloaded.tempPath, updatedAt: now })
-        .where(eq(videoGenerations.id, generationId))
-        .run();
+      // Upload downloaded file to Supabase Storage
+      const storagePath = await uploadVideoToStorage(downloaded.tempPath, gen.videoScreenId, generationId);
+      await db
+        .update(videoGenerations)
+        .set({ jobId: result.jobId, status: 'completed', videoStoragePath: storagePath, updatedAt: now })
+        .where(eq(videoGenerations.id, generationId));
     } else {
-      db.update(videoGenerations)
-        .set({ jobId, status: 'pending', updatedAt: now })
-        .where(eq(videoGenerations.id, generationId))
-        .run();
+      await db
+        .update(videoGenerations)
+        .set({ jobId: result.jobId, status: 'pending', updatedAt: now })
+        .where(eq(videoGenerations.id, generationId));
     }
   } catch (err: unknown) {
-    db.update(videoGenerations)
+    await db
+      .update(videoGenerations)
       .set({ status: 'failed', errorMessage: (err instanceof Error ? err.message : String(err)), updatedAt: Date.now() })
-      .where(eq(videoGenerations.id, generationId))
-      .run();
+      .where(eq(videoGenerations.id, generationId));
     throw err;
   }
 }
 
 // ── Generate All Scenes ───────────────────────────────────────────────────────
 
-export function enqueueAllSceneGenerations(
+export async function enqueueAllSceneGenerations(
   videoProjectId: number,
-): { enqueued: number; skipped: number; generationIds: number[] } {
-  const screens = db
+): Promise<{ enqueued: number; skipped: number; generationIds: number[] }> {
+  const allScreens = await db
     .select()
     .from(videoScreens)
-    .where(eq(videoScreens.videoProjectId, videoProjectId))
-    .all()
+    .where(eq(videoScreens.videoProjectId, videoProjectId));
+  const screens = allScreens
     .filter((s) => !s.approvedGenerationId)
     .sort((a, b) => a.position - b.position);
 
@@ -749,38 +699,34 @@ export function enqueueAllSceneGenerations(
   let skipped = 0;
 
   for (const screen of screens) {
-    // Skip if already has an active or queued generation
-    const existingActive = db
+    const allGens = await db
       .select()
       .from(videoGenerations)
-      .where(eq(videoGenerations.videoScreenId, screen.id))
-      .all()
-      .find((g) => ['queued', 'pending', 'processing'].includes(g.status));
+      .where(eq(videoGenerations.videoScreenId, screen.id));
+    const existingActive = allGens.find((g) => ['queued', 'pending', 'processing'].includes(g.status));
     if (existingActive) { skipped++; continue; }
 
-    // Get latest prompt version for this screen
-    const latestPrompt = db
+    const allVersions = await db
       .select()
       .from(screenPromptVersions)
-      .where(eq(screenPromptVersions.videoScreenId, screen.id))
-      .all()
-      .sort((a, b) => b.version - a.version)[0];
+      .where(eq(screenPromptVersions.videoScreenId, screen.id));
+    const latestPrompt = allVersions.sort((a, b) => b.version - a.version)[0];
     if (!latestPrompt) { skipped++; continue; }
 
-    const insertResult = db
+    const inserted = await db
       .insert(videoGenerations)
       .values({
         videoScreenId: screen.id,
         promptVersionId: latestPrompt.id,
         jobId: null,
         status: 'queued',
-        videoLocalPath: null,
+        videoStoragePath: null,
         durationSeconds: screen.durationSeconds ?? DEFAULT_DURATION(),
         createdAt: now,
         updatedAt: now,
       })
-      .run();
-    generationIds.push(Number(insertResult.lastInsertRowid));
+      .returning({ id: videoGenerations.id });
+    generationIds.push(inserted[0].id);
   }
 
   return { enqueued: generationIds.length, skipped, generationIds };
@@ -792,27 +738,22 @@ export async function saveManualPromptEdit(
   videoScreenId: number,
   promptText: string,
 ): Promise<{ version: number; validation: ValidationResult }> {
-  const screen = db
+  const screenRows = await db
     .select()
     .from(videoScreens)
     .where(eq(videoScreens.id, videoScreenId))
-    .limit(1)
-    .get();
+    .limit(1);
+  const screen = screenRows[0];
 
-  const project = screen
-    ? db
-        .select()
-        .from(videoProjects)
-        .where(eq(videoProjects.id, screen.videoProjectId))
-        .limit(1)
-        .get()
-    : null;
-
+  const projectRows = screen
+    ? await db.select().from(videoProjects).where(eq(videoProjects.id, screen.videoProjectId)).limit(1)
+    : [];
+  const project = projectRows[0];
   const brief = parseBrief(project?.creativeBrief);
 
   const screenNumber = screen?.screenNumber ?? 0;
   const screen1Info = screenNumber > 1 && screen && project
-    ? getScreen1ApprovedPromptInfo(screen.videoProjectId)
+    ? await getScreen1ApprovedPromptInfo(screen.videoProjectId)
     : null;
   const version = await insertPromptVersion(
     videoScreenId, promptText, 'manual', undefined, undefined,
@@ -832,33 +773,19 @@ export async function submitVideoGeneration(
   durationOverride?: number,
   provider: VideoGenerationProvider = useapiProvider,
 ): Promise<{ generationId: number }> {
-  const project = db
-    .select()
-    .from(videoProjects)
-    .where(eq(videoProjects.id, videoProjectId))
-    .limit(1)
-    .get();
+  const [projectRows, pvRows, screenRows] = await Promise.all([
+    db.select().from(videoProjects).where(eq(videoProjects.id, videoProjectId)).limit(1),
+    db.select().from(screenPromptVersions).where(eq(screenPromptVersions.id, promptVersionId)).limit(1),
+    db.select().from(videoScreens).where(eq(videoScreens.id, videoScreenId)).limit(1),
+  ]);
+  const project = projectRows[0];
+  const promptVersion = pvRows[0];
+  const screen = screenRows[0];
   if (!project) throw new Error(`Video project ${videoProjectId} not found`);
-
-  const promptVersion = db
-    .select()
-    .from(screenPromptVersions)
-    .where(eq(screenPromptVersions.id, promptVersionId))
-    .limit(1)
-    .get();
   if (!promptVersion) throw new Error(`Prompt version ${promptVersionId} not found`);
 
-  const screen = db
-    .select()
-    .from(videoScreens)
-    .where(eq(videoScreens.id, videoScreenId))
-    .limit(1)
-    .get();
-
-  // durationOverride wins, then screen's recommendation, then env default
   const duration = durationOverride ?? screen?.durationSeconds ?? DEFAULT_DURATION();
 
-  // Ensure base image is uploaded and mediaGenerationId is cached
   let referenceImageMediaId = project.baseImageMediaId;
   if (!referenceImageMediaId) {
     if (process.env.MOCK_USEAPI === 'true') {
@@ -871,70 +798,81 @@ export async function submitVideoGeneration(
       });
       referenceImageMediaId = uploaded.mediaGenerationId ?? null;
       if (referenceImageMediaId) {
-        db.update(videoProjects)
+        await db
+          .update(videoProjects)
           .set({ baseImageMediaId: referenceImageMediaId, updatedAt: Date.now() })
-          .where(eq(videoProjects.id, videoProjectId))
-          .run();
+          .where(eq(videoProjects.id, videoProjectId));
       }
     }
   }
 
   const now = Date.now();
-  let jobId: string | undefined;
 
   if (process.env.MOCK_USEAPI === 'true') {
-    jobId = `mock-job-${now}`;
-  } else {
-    const result = await provider.submitGeneration({
-      prompt: promptVersion.promptText,
-      model: DEFAULT_MODEL(),
-      referenceImageMediaId,
-      duration,
-      aspectRatio: 'portrait',
-      correlationId: `screen-${videoScreenId}-v${promptVersionId}`,
-    });
-    jobId = result.jobId;
-
-    // API may complete generation synchronously — download immediately if so
-    if (result.videoUrl) {
-      const downloaded = await provider.downloadVideo({
-        jobId,
-        signedUrl: result.videoUrl,
-        outputMediaGenerationId: result.mediaGenerationId ?? null,
-        jobCompletedAt: now,
-      });
-      const insertResult = db
-        .insert(videoGenerations)
-        .values({
-          videoScreenId,
-          promptVersionId,
-          jobId: jobId ?? null,
-          status: 'completed',
-          videoLocalPath: downloaded.tempPath,
-          durationSeconds: duration,
-          createdAt: now,
-          updatedAt: now,
-        })
-        .run();
-      return { generationId: Number(insertResult.lastInsertRowid) };
-    }
+    const inserted = await db
+      .insert(videoGenerations)
+      .values({
+        videoScreenId,
+        promptVersionId,
+        jobId: `mock-job-${now}`,
+        status: 'completed',
+        videoStoragePath: null,
+        durationSeconds: duration,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .returning({ id: videoGenerations.id });
+    return { generationId: inserted[0].id };
   }
 
-  const insertResult = db
+  const result = await provider.submitGeneration({
+    prompt: promptVersion.promptText,
+    model: DEFAULT_MODEL(),
+    referenceImageMediaId,
+    duration,
+    aspectRatio: 'portrait',
+    correlationId: `screen-${videoScreenId}-v${promptVersionId}`,
+  });
+
+  if (result.videoUrl) {
+    const downloaded = await provider.downloadVideo({
+      jobId: result.jobId,
+      signedUrl: result.videoUrl,
+      outputMediaGenerationId: result.mediaGenerationId ?? null,
+      jobCompletedAt: now,
+    });
+    const storagePath = await uploadVideoToStorage(downloaded.tempPath, videoScreenId, 0);
+    const inserted = await db
+      .insert(videoGenerations)
+      .values({
+        videoScreenId,
+        promptVersionId,
+        jobId: result.jobId ?? null,
+        status: 'completed',
+        videoStoragePath: storagePath,
+        durationSeconds: duration,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .returning({ id: videoGenerations.id });
+    return { generationId: inserted[0].id };
+  }
+
+  const inserted = await db
     .insert(videoGenerations)
     .values({
       videoScreenId,
       promptVersionId,
-      jobId: jobId ?? null,
-      status: process.env.MOCK_USEAPI === 'true' ? 'completed' : 'pending',
-      videoLocalPath: null,
+      jobId: result.jobId ?? null,
+      status: 'pending',
+      videoStoragePath: null,
       durationSeconds: duration,
       createdAt: now,
       updatedAt: now,
     })
-    .run();
+    .returning({ id: videoGenerations.id });
 
-  return { generationId: Number(insertResult.lastInsertRowid) };
+  return { generationId: inserted[0].id };
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -948,29 +886,47 @@ async function insertPromptVersion(
   screen1PromptVersionId?: number | null,
   creativeBriefSnapshot?: string | null,
 ): Promise<number> {
-  const existing = db
+  const rows = await db
     .select({ maxVersion: max(screenPromptVersions.version) })
     .from(screenPromptVersions)
-    .where(eq(screenPromptVersions.videoScreenId, videoScreenId))
-    .get();
+    .where(eq(screenPromptVersions.videoScreenId, videoScreenId));
 
-  const nextVersion = (existing?.maxVersion ?? 0) + 1;
+  const nextVersion = (rows[0]?.maxVersion ?? 0) + 1;
 
-  db.insert(screenPromptVersions)
-    .values({
-      videoScreenId,
-      version: nextVersion,
-      promptText,
-      source,
-      nlFeedback: nlFeedback ?? null,
-      feedbackScope: feedbackScope ?? null,
-      screen1PromptVersionId: screen1PromptVersionId ?? null,
-      creativeBriefSnapshot: creativeBriefSnapshot ?? null,
-      createdAt: Date.now(),
-    })
-    .run();
+  await db.insert(screenPromptVersions).values({
+    videoScreenId,
+    version: nextVersion,
+    promptText,
+    source,
+    nlFeedback: nlFeedback ?? null,
+    feedbackScope: feedbackScope ?? null,
+    screen1PromptVersionId: screen1PromptVersionId ?? null,
+    creativeBriefSnapshot: creativeBriefSnapshot ?? null,
+    createdAt: Date.now(),
+  });
 
   return nextVersion;
+}
+
+async function uploadVideoToStorage(localPath: string, videoScreenId: number, generationId: number): Promise<string> {
+  const { createClient } = await import('@supabase/supabase-js');
+  const supabase = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    { auth: { persistSession: false } },
+  );
+  const fs = await import('node:fs/promises');
+  const fileBuffer = await fs.readFile(localPath);
+  const storagePath = `screen-${videoScreenId}/${Date.now()}-gen-${generationId}.mp4`;
+  const bucket = process.env.SUPABASE_BUCKET_VIDEOS ?? 'videos';
+  const { error } = await supabase.storage.from(bucket).upload(storagePath, fileBuffer, {
+    contentType: 'video/mp4',
+    upsert: false,
+  });
+  if (error) throw new Error(`Failed to upload video to Supabase Storage: ${error.message}`);
+  // Clean up temp file (non-fatal if it fails)
+  fs.unlink(localPath).catch(() => {});
+  return storagePath;
 }
 
 function guessContentType(filePath: string): string {

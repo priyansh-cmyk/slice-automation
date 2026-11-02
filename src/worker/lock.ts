@@ -1,59 +1,40 @@
-import { randomUUID } from 'node:crypto';
-import { eq } from 'drizzle-orm';
-import { db } from '../db/index';
-import { withImmediateTransaction } from '../db/transactions';
-import { workerLock } from '../db/schema';
+import postgres from 'postgres';
 
-const HEARTBEAT_INTERVAL_MS = 10_000;
-const STALE_THRESHOLD_MS = 30_000;
+// Uses a persistent direct connection (port 5432) for pg_advisory_lock.
+// The pooler (port 6543) is transaction-scoped and cannot hold session-level advisory locks.
 
-export const ownerToken = randomUUID();
+const ADVISORY_LOCK_KEY = 1n; // bigint advisory lock key
 
-export function acquireLock(): boolean {
-  return withImmediateTransaction((tx) => {
-    const now = Date.now();
-    const existing = tx
-      .select()
-      .from(workerLock)
-      .where(eq(workerLock.id, 1))
-      .limit(1)
-      .get();
+let _sql: ReturnType<typeof postgres> | null = null;
+let _lockHeld = false;
 
-    if (existing) {
-      const isStale = now - existing.heartbeatAt > STALE_THRESHOLD_MS;
-      if (!isStale && existing.ownerToken !== ownerToken) {
-        return false;
-      }
-      const result = tx
-        .update(workerLock)
-        .set({
-          ownerToken,
-          acquiredAt: existing.ownerToken === ownerToken ? existing.acquiredAt : now,
-          heartbeatAt: now,
-        })
-        .where(eq(workerLock.id, 1))
-        .run();
-      return result.changes > 0;
-    }
-
-    tx.insert(workerLock)
-      .values({ id: 1, ownerToken, acquiredAt: now, heartbeatAt: now })
-      .run();
-    return true;
-  });
+function getSql(): ReturnType<typeof postgres> {
+  if (!_sql) {
+    const url = process.env.DATABASE_DIRECT_URL ?? process.env.DATABASE_URL!;
+    _sql = postgres(url, { max: 1, idle_timeout: 0 });
+  }
+  return _sql;
 }
 
-export function sendHeartbeat(): void {
-  db.update(workerLock)
-    .set({ heartbeatAt: Date.now() })
-    .where(eq(workerLock.ownerToken, ownerToken))
-    .run();
+export async function acquireLock(): Promise<boolean> {
+  if (_lockHeld) return true;
+  const sql = getSql();
+  // pg_advisory_lock_int8 tries immediately; returns true if acquired, false if not
+  const rows = await sql`SELECT pg_try_advisory_lock(${ADVISORY_LOCK_KEY}::bigint) AS acquired`;
+  _lockHeld = rows[0]?.acquired === true;
+  return _lockHeld;
 }
 
-export function releaseLock(): void {
-  db.delete(workerLock).where(eq(workerLock.ownerToken, ownerToken)).run();
+export async function releaseLock(): Promise<void> {
+  if (!_lockHeld) return;
+  const sql = getSql();
+  await sql`SELECT pg_advisory_unlock(${ADVISORY_LOCK_KEY}::bigint)`;
+  _lockHeld = false;
 }
 
-export function startHeartbeat(): NodeJS.Timeout {
-  return setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
+export async function closeLockConnection(): Promise<void> {
+  if (_sql) {
+    await _sql.end();
+    _sql = null;
+  }
 }

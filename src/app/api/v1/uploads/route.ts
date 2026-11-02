@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import * as crypto from 'node:crypto';
+import { createClient } from '@/lib/supabase/server';
+import { createClient as createServiceClient } from '@supabase/supabase-js';
 
 const ALLOWED_TYPES: Record<string, string> = {
   'image/jpeg': 'jpg',
@@ -11,14 +11,11 @@ const ALLOWED_TYPES: Record<string, string> = {
   'image/gif': 'gif',
 };
 
-function uploadsDir(): string {
-  const storageDir = path.resolve(process.env.STORAGE_DIR ?? './storage');
-  const dir = path.join(storageDir, 'uploads');
-  fs.mkdirSync(dir, { recursive: true });
-  return dir;
-}
-
 export async function POST(req: NextRequest): Promise<NextResponse> {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+
   let formData: FormData;
   try {
     formData = await req.formData();
@@ -40,17 +37,37 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   }
 
   const filename = `${crypto.randomUUID()}.${ext}`;
-  const dir = uploadsDir();
-  const storedPath = path.join(dir, filename);
-
+  // Store under a per-user prefix so RLS path-based checks can be applied if needed
+  const storagePath = `${user.id}/${filename}`;
   const buffer = Buffer.from(await file.arrayBuffer());
-  fs.writeFileSync(storedPath, buffer);
+
+  // Use service-role client to bypass RLS on the upload itself
+  const serviceSupabase = createServiceClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    { auth: { persistSession: false } },
+  );
+
+  const bucket = process.env.SUPABASE_BUCKET_UPLOADS ?? 'uploads';
+  const { error } = await serviceSupabase.storage.from(bucket).upload(storagePath, buffer, {
+    contentType: file.type,
+    upsert: false,
+  });
+
+  if (error) {
+    console.error('[uploads] Supabase Storage upload error:', error.message);
+    return NextResponse.json({ error: 'Failed to upload file' }, { status: 500 });
+  }
+
+  // Generate a short-lived signed URL for the preview
+  const { data: signedData } = await serviceSupabase.storage
+    .from(bucket)
+    .createSignedUrl(storagePath, 3600);
 
   return NextResponse.json(
     {
-      filename,
-      storedPath,
-      previewUrl: `/api/v1/uploads/${filename}`,
+      storagePath,
+      previewUrl: signedData?.signedUrl ?? null,
       contentType: file.type,
       size: buffer.length,
     },

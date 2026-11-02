@@ -2,11 +2,16 @@ import * as path from 'node:path';
 import dotenv from 'dotenv';
 dotenv.config({ path: path.resolve(process.cwd(), '.env.local') });
 
-import { acquireLock, releaseLock, startHeartbeat, ownerToken } from './lock';
-import { validateEnv, ensureDataDir } from '../lib/startup-checks';
+import { acquireLock, releaseLock, closeLockConnection } from './lock';
+import { validateEnv } from '../lib/startup-checks';
 import { db } from '../db';
-import { videoGenerations, promptGenerationTasks, videoScreens, videoProjects, screenPromptVersions } from '../db/schema';
-import { eq, inArray } from 'drizzle-orm';
+import {
+  videoGenerations,
+  promptGenerationTasks,
+  videoScreens,
+  screenPromptVersions,
+} from '../db/schema.pg';
+import { eq, inArray, isNull, lt, and } from 'drizzle-orm';
 import { useapiProvider } from '../providers/useapi/provider';
 import { PermanentDownloadError, OutputExpiredError, AuthenticationError } from '../providers/useapi/errors';
 import {
@@ -14,30 +19,63 @@ import {
   generateInitialScreenPrompt,
   submitQueuedGeneration,
 } from '../services/video-workflow';
+import { createClient } from '@supabase/supabase-js';
 
 const POLL_INTERVAL_MS = 5_000;
+const PROMPT_TASK_LEASE_MS = 10 * 60 * 1000;   // 10 min — enough for a Claude call
+const VIDEO_GEN_LEASE_MS  = 2 * 60 * 60 * 1000; // 2 hr  — enough for a slow generation
+const HEARTBEAT_MS = 2 * 60 * 1000;              // renew lease every 2 min
 
 async function main(): Promise<void> {
   validateEnv();
-  ensureDataDir();
 
-  if (!acquireLock()) {
-    console.log(`[worker] Another worker is active. Exiting. (token prefix: ${ownerToken.slice(0, 8)})`);
+  const acquired = await acquireLock();
+  if (!acquired) {
+    console.log('[worker] Another worker holds the advisory lock. Exiting.');
     process.exit(0);
   }
 
-  console.log(`[worker] Lock acquired. (token prefix: ${ownerToken.slice(0, 8)})`);
-  const heartbeat = startHeartbeat();
+  console.log('[worker] Lock acquired.');
 
-  process.on('SIGTERM', () => shutdown('SIGTERM', heartbeat));
-  process.on('SIGINT', () => shutdown('SIGINT', heartbeat));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT',  () => shutdown('SIGINT'));
 
+  await recoverStaleTasks();
   await runLoop();
+}
+
+async function recoverStaleTasks(): Promise<void> {
+  const now = Date.now();
+
+  // Prompt generation tasks claimed but not progressed past their lease
+  const stalePromptThreshold = now - PROMPT_TASK_LEASE_MS;
+  await db
+    .update(promptGenerationTasks)
+    .set({ status: 'pending', claimedAt: null, updatedAt: now })
+    .where(
+      and(
+        eq(promptGenerationTasks.status, 'processing'),
+        lt(promptGenerationTasks.claimedAt, stalePromptThreshold),
+      ),
+    );
+
+  // Video generations stuck in processing past lease
+  const staleVideoThreshold = now - VIDEO_GEN_LEASE_MS;
+  await db
+    .update(videoGenerations)
+    .set({ status: 'queued', updatedAt: now })
+    .where(
+      and(
+        eq(videoGenerations.status, 'processing'),
+        lt(videoGenerations.claimedAt, staleVideoThreshold),
+      ),
+    );
+
+  console.log('[worker] Stale task recovery complete.');
 }
 
 async function runLoop(): Promise<void> {
   console.log('[worker] Polling loop started.');
-
   while (true) {
     await tick();
     await sleep(POLL_INTERVAL_MS);
@@ -45,20 +83,131 @@ async function runLoop(): Promise<void> {
 }
 
 async function tick(): Promise<void> {
-  // 1. Process prompt generation tasks (extract_brief before generate_prompt)
   await processPromptTasks();
-
-  // 2. Submit queued video generations
   await processQueuedGenerations();
 
   if (process.env.MOCK_USEAPI === 'true') return;
 
-  // 3. Poll in-flight video generations
-  const pending = db
+  await pollInFlightGenerations();
+}
+
+async function processPromptTasks(): Promise<void> {
+  const allPending = await db
+    .select()
+    .from(promptGenerationTasks)
+    .where(eq(promptGenerationTasks.status, 'pending'));
+
+  const tasks = allPending.sort((a, b) => a.id - b.id);
+  if (tasks.length === 0) return;
+
+  for (const task of tasks) {
+    if (task.taskType === 'generate_prompt') {
+      const blockedByExtract = await db
+        .select()
+        .from(promptGenerationTasks)
+        .where(
+          and(
+            eq(promptGenerationTasks.videoProjectId, task.videoProjectId),
+            eq(promptGenerationTasks.taskType, 'extract_brief'),
+          ),
+        )
+        .then((rows) => rows.some((t) => t.status !== 'completed' && t.status !== 'failed'));
+      if (blockedByExtract) continue;
+    }
+
+    const now = Date.now();
+    await db
+      .update(promptGenerationTasks)
+      .set({ status: 'processing', claimedAt: now, updatedAt: now })
+      .where(eq(promptGenerationTasks.id, task.id));
+
+    // Heartbeat interval: renew claimedAt while Claude is running
+    const heartbeat = setInterval(async () => {
+      await db
+        .update(promptGenerationTasks)
+        .set({ claimedAt: Date.now(), updatedAt: Date.now() })
+        .where(eq(promptGenerationTasks.id, task.id));
+    }, HEARTBEAT_MS);
+
+    try {
+      if (task.taskType === 'extract_brief') {
+        const screen1Rows = task.videoScreenId
+          ? await db.select().from(videoScreens).where(eq(videoScreens.id, task.videoScreenId)).limit(1)
+          : [];
+        const screen1 = screen1Rows[0];
+        const approvedGenId = screen1?.approvedGenerationId;
+
+        let approvedPromptText: string | null = null;
+        if (approvedGenId) {
+          const genRows = await db.select().from(videoGenerations).where(eq(videoGenerations.id, approvedGenId)).limit(1);
+          const gen = genRows[0];
+          if (gen) {
+            const pvRows = await db.select().from(screenPromptVersions).where(eq(screenPromptVersions.id, gen.promptVersionId)).limit(1);
+            approvedPromptText = pvRows[0]?.promptText ?? null;
+          }
+        }
+
+        if (!approvedPromptText) {
+          throw new Error('No approved prompt found for Screen 1 — cannot extract creative brief');
+        }
+
+        await extractAndStoreCreativeBrief(task.videoProjectId, approvedPromptText, task.videoScreenId ?? undefined);
+        console.log(`[worker] extract_brief task ${task.id} completed for project ${task.videoProjectId}`);
+
+      } else if (task.taskType === 'generate_prompt') {
+        if (!task.videoScreenId) throw new Error('generate_prompt task missing videoScreenId');
+        await generateInitialScreenPrompt(task.videoProjectId, task.videoScreenId);
+        console.log(`[worker] generate_prompt task ${task.id} completed for screen ${task.videoScreenId}`);
+      }
+
+      clearInterval(heartbeat);
+      await db
+        .update(promptGenerationTasks)
+        .set({ status: 'completed', updatedAt: Date.now() })
+        .where(eq(promptGenerationTasks.id, task.id));
+
+    } catch (err: unknown) {
+      clearInterval(heartbeat);
+      await db
+        .update(promptGenerationTasks)
+        .set({
+          status: 'failed',
+          claimedAt: null,
+          errorMessage: (err instanceof Error ? err.message : String(err)),
+          updatedAt: Date.now(),
+        })
+        .where(eq(promptGenerationTasks.id, task.id));
+      console.error(`[worker] prompt task ${task.id} (${task.taskType}) failed:`, err);
+    }
+
+    break; // one task per tick
+  }
+}
+
+async function processQueuedGenerations(): Promise<void> {
+  const queued = await db
     .select()
     .from(videoGenerations)
-    .where(inArray(videoGenerations.status, ['pending', 'processing']))
-    .all();
+    .where(eq(videoGenerations.status, 'queued'));
+
+  if (queued.length === 0) return;
+  console.log(`[worker] Submitting ${queued.length} queued generation(s)…`);
+
+  for (const gen of queued) {
+    try {
+      await submitQueuedGeneration(gen.id, useapiProvider);
+      console.log(`[worker] Queued gen ${gen.id} submitted`);
+    } catch (err: unknown) {
+      console.error(`[worker] Error submitting queued gen ${gen.id}:`, err);
+    }
+  }
+}
+
+async function pollInFlightGenerations(): Promise<void> {
+  const pending = await db
+    .select()
+    .from(videoGenerations)
+    .where(inArray(videoGenerations.status, ['pending', 'processing']));
 
   if (pending.length === 0) return;
   console.log(`[worker] Polling ${pending.length} job(s)…`);
@@ -77,47 +226,43 @@ async function tick(): Promise<void> {
             outputMediaGenerationId: result.outputMediaGenerationId ?? null,
             jobCompletedAt: now,
           });
-          db.update(videoGenerations)
-            .set({
-              status: 'completed',
-              videoLocalPath: downloaded.tempPath,
-              updatedAt: now,
-            })
-            .where(eq(videoGenerations.id, gen.id))
-            .run();
-          console.log(`[worker] Gen ${gen.id} completed → ${downloaded.tempPath}`);
+          const storagePath = await uploadVideoToStorage(downloaded.tempPath, gen.videoScreenId, gen.id);
+          await db
+            .update(videoGenerations)
+            .set({ status: 'completed', videoStoragePath: storagePath, claimedAt: null, updatedAt: now })
+            .where(eq(videoGenerations.id, gen.id));
+          console.log(`[worker] Gen ${gen.id} completed → ${storagePath}`);
         } catch (dlErr: unknown) {
-          if (dlErr instanceof PermanentDownloadError || dlErr instanceof OutputExpiredError || dlErr instanceof AuthenticationError) {
-            db.update(videoGenerations)
-              .set({ status: 'failed', errorMessage: (dlErr as Error).message, updatedAt: now })
-              .where(eq(videoGenerations.id, gen.id))
-              .run();
+          if (
+            dlErr instanceof PermanentDownloadError ||
+            dlErr instanceof OutputExpiredError ||
+            dlErr instanceof AuthenticationError
+          ) {
+            await db
+              .update(videoGenerations)
+              .set({ status: 'failed', errorMessage: (dlErr as Error).message, claimedAt: null, updatedAt: now })
+              .where(eq(videoGenerations.id, gen.id));
             console.error(`[worker] Gen ${gen.id} download permanently failed: ${(dlErr as Error).message}`);
           } else {
             console.error(`[worker] Gen ${gen.id} download transient error (will retry):`, dlErr);
           }
         }
       } else if (result.status === 'completed' && !result.videoUrl) {
-        db.update(videoGenerations)
-          .set({ status: 'failed', errorMessage: 'Video completed but URL was not returned by provider', updatedAt: now })
-          .where(eq(videoGenerations.id, gen.id))
-          .run();
-        console.error(`[worker] Gen ${gen.id} completed with no video URL - marking failed`);
+        await db
+          .update(videoGenerations)
+          .set({ status: 'failed', errorMessage: 'Video completed but URL was not returned by provider', claimedAt: null, updatedAt: now })
+          .where(eq(videoGenerations.id, gen.id));
       } else if (result.status === 'failed') {
-        db.update(videoGenerations)
-          .set({
-            status: 'failed',
-            errorMessage: result.errorMessage ?? 'Provider reported failure',
-            updatedAt: now,
-          })
-          .where(eq(videoGenerations.id, gen.id))
-          .run();
+        await db
+          .update(videoGenerations)
+          .set({ status: 'failed', errorMessage: result.errorMessage ?? 'Provider reported failure', claimedAt: null, updatedAt: now })
+          .where(eq(videoGenerations.id, gen.id));
         console.log(`[worker] Gen ${gen.id} failed: ${result.errorMessage}`);
       } else if (result.status === 'started' && gen.status === 'pending') {
-        db.update(videoGenerations)
-          .set({ status: 'processing', updatedAt: now })
-          .where(eq(videoGenerations.id, gen.id))
-          .run();
+        await db
+          .update(videoGenerations)
+          .set({ status: 'processing', claimedAt: now, updatedAt: now })
+          .where(eq(videoGenerations.id, gen.id));
       }
     } catch (err: unknown) {
       console.error(`[worker] Error polling gen ${gen.id}:`, err);
@@ -125,114 +270,33 @@ async function tick(): Promise<void> {
   }
 }
 
-async function processPromptTasks(): Promise<void> {
-  // Pick one pending task at a time — extract_brief tasks must complete before generate_prompt tasks run
-  // for the same project. We order by id (creation order) so extract_brief (created first) runs first.
-  const tasks = db
-    .select()
-    .from(promptGenerationTasks)
-    .where(eq(promptGenerationTasks.status, 'pending'))
-    .all()
-    .sort((a, b) => a.id - b.id);
-
-  if (tasks.length === 0) return;
-
-  for (const task of tasks) {
-    // If generate_prompt task: ensure extract_brief for this project is completed first
-    if (task.taskType === 'generate_prompt') {
-      const extractTask = db
-        .select()
-        .from(promptGenerationTasks)
-        .where(eq(promptGenerationTasks.videoProjectId, task.videoProjectId))
-        .all()
-        .find((t) => t.taskType === 'extract_brief' && t.status !== 'completed' && t.status !== 'failed');
-      if (extractTask) continue; // wait for extract_brief to finish
-    }
-
-    const now = Date.now();
-    // Mark as processing
-    db.update(promptGenerationTasks)
-      .set({ status: 'processing', updatedAt: now })
-      .where(eq(promptGenerationTasks.id, task.id))
-      .run();
-
-    try {
-      if (task.taskType === 'extract_brief') {
-        // Load the approved Screen 1 prompt text
-        const screen1 = task.videoScreenId
-          ? db.select().from(videoScreens).where(eq(videoScreens.id, task.videoScreenId)).limit(1).get()
-          : null;
-        const approvedGenId = screen1?.approvedGenerationId;
-        const approvedPromptText = approvedGenId
-          ? (() => {
-              const gen = db.select().from(videoGenerations).where(eq(videoGenerations.id, approvedGenId)).limit(1).get();
-              const pv = gen ? db.select().from(screenPromptVersions).where(eq(screenPromptVersions.id, gen.promptVersionId)).limit(1).get() : null;
-              return pv?.promptText ?? null;
-            })()
-          : null;
-
-        if (!approvedPromptText) {
-          throw new Error('No approved prompt found for Screen 1 — cannot extract creative brief');
-        }
-
-        await extractAndStoreCreativeBrief(task.videoProjectId, approvedPromptText, task.videoScreenId ?? undefined);
-        console.log(`[worker] extract_brief task ${task.id} completed for project ${task.videoProjectId}`);
-
-      } else if (task.taskType === 'generate_prompt') {
-        if (!task.videoScreenId) throw new Error('generate_prompt task missing videoScreenId');
-        const screen = db.select().from(videoScreens).where(eq(videoScreens.id, task.videoScreenId)).limit(1).get();
-        if (!screen) throw new Error(`Screen ${task.videoScreenId} not found`);
-        await generateInitialScreenPrompt(task.videoProjectId, task.videoScreenId);
-        console.log(`[worker] generate_prompt task ${task.id} completed for screen ${task.videoScreenId}`);
-      }
-
-      db.update(promptGenerationTasks)
-        .set({ status: 'completed', updatedAt: Date.now() })
-        .where(eq(promptGenerationTasks.id, task.id))
-        .run();
-
-    } catch (err: unknown) {
-      db.update(promptGenerationTasks)
-        .set({ status: 'failed', errorMessage: (err instanceof Error ? err.message : String(err)), updatedAt: Date.now() })
-        .where(eq(promptGenerationTasks.id, task.id))
-        .run();
-      console.error(`[worker] prompt task ${task.id} (${task.taskType}) failed:`, err);
-    }
-
-    // Only process one task per tick to keep the loop responsive
-    break;
-  }
-}
-
-async function processQueuedGenerations(): Promise<void> {
-  const queued = db
-    .select()
-    .from(videoGenerations)
-    .where(eq(videoGenerations.status, 'queued'))
-    .all();
-
-  if (queued.length === 0) return;
-  console.log(`[worker] Submitting ${queued.length} queued generation(s)…`);
-
-  for (const gen of queued) {
-    try {
-      await submitQueuedGeneration(gen.id, useapiProvider);
-      console.log(`[worker] Queued gen ${gen.id} submitted`);
-    } catch (err: unknown) {
-      console.error(`[worker] Error submitting queued gen ${gen.id}:`, err);
-      // submitQueuedGeneration already marks it failed on error; continue with others
-    }
-  }
+async function uploadVideoToStorage(localPath: string, videoScreenId: number, generationId: number): Promise<string> {
+  const supabase = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    { auth: { persistSession: false } },
+  );
+  const fs = await import('node:fs/promises');
+  const fileBuffer = await fs.readFile(localPath);
+  const storagePath = `screen-${videoScreenId}/${Date.now()}-gen-${generationId}.mp4`;
+  const bucket = process.env.SUPABASE_BUCKET_VIDEOS ?? 'videos';
+  const { error } = await supabase.storage.from(bucket).upload(storagePath, fileBuffer, {
+    contentType: 'video/mp4',
+    upsert: false,
+  });
+  if (error) throw new Error(`Failed to upload video to Supabase Storage: ${error.message}`);
+  fs.unlink(localPath).catch(() => {});
+  return storagePath;
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function shutdown(signal: string, heartbeat: NodeJS.Timeout): void {
+async function shutdown(signal: string): Promise<void> {
   console.log(`[worker] ${signal} received. Releasing lock and exiting.`);
-  clearInterval(heartbeat);
-  releaseLock();
+  await releaseLock();
+  await closeLockConnection();
   process.exit(0);
 }
 

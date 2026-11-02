@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/db';
-import { videoScreens, screenPromptVersions } from '@/db/schema';
+import { videoScreens, screenPromptVersions } from '@/db/schema.pg';
+import { createClient } from '@/lib/supabase/server';
 import { and, eq } from 'drizzle-orm';
 
 export async function GET(
@@ -14,25 +15,22 @@ export async function GET(
     return NextResponse.json({ error: 'Invalid params' }, { status: 400 });
   }
 
-  const screen = db
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const screenRows = await db
     .select()
     .from(videoScreens)
-    .where(
-      and(
-        eq(videoScreens.videoProjectId, projectId),
-        eq(videoScreens.screenNumber, screenNumber),
-      ),
-    )
-    .limit(1)
-    .get();
+    .where(and(eq(videoScreens.videoProjectId, projectId), eq(videoScreens.screenNumber, screenNumber)))
+    .limit(1);
+  const screen = screenRows[0];
   if (!screen) return NextResponse.json({ error: 'Screen not found' }, { status: 404 });
 
-  const versions = db
+  const versions = await db
     .select()
     .from(screenPromptVersions)
-    .where(eq(screenPromptVersions.videoScreenId, screen.id))
-    .all()
-    .sort((a, b) => b.version - a.version);
+    .where(eq(screenPromptVersions.videoScreenId, screen.id));
 
-  return NextResponse.json(versions);
+  return NextResponse.json(versions.sort((a, b) => b.version - a.version));
 }

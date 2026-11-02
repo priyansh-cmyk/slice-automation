@@ -1,9 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/db';
-import { videoProjects, videoScreens, screenPromptVersions, videoGenerations } from '@/db/schema';
+import { videoProjects, videoScreens, screenPromptVersions, videoGenerations } from '@/db/schema.pg';
+import { createClient } from '@/lib/supabase/server';
 import { eq, inArray } from 'drizzle-orm';
-import * as path from 'node:path';
-import * as fs from 'node:fs';
 
 export async function GET(
   _req: NextRequest,
@@ -13,65 +12,62 @@ export async function GET(
   const projectId = parseInt(id, 10);
   if (isNaN(projectId)) return NextResponse.json({ error: 'Invalid id' }, { status: 400 });
 
-  const project = db
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const projectRows = await db
     .select()
     .from(videoProjects)
     .where(eq(videoProjects.id, projectId))
-    .limit(1)
-    .get();
+    .limit(1);
+  const project = projectRows[0];
   if (!project) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
-  const screens = db
+  const allScreens = await db
     .select()
     .from(videoScreens)
-    .where(eq(videoScreens.videoProjectId, projectId))
-    .all()
-    .sort((a, b) => a.position - b.position);
-
+    .where(eq(videoScreens.videoProjectId, projectId));
+  const screens = allScreens.sort((a, b) => a.position - b.position);
   const screenIds = screens.map((s) => s.id);
 
-  // Per-screen prompt presence
   const promptPresence = new Map<number, boolean>();
   if (screenIds.length > 0) {
-    const rows = db
+    const rows = await db
       .select({ videoScreenId: screenPromptVersions.videoScreenId })
       .from(screenPromptVersions)
-      .where(inArray(screenPromptVersions.videoScreenId, screenIds))
-      .all();
+      .where(inArray(screenPromptVersions.videoScreenId, screenIds));
     for (const r of rows) promptPresence.set(r.videoScreenId, true);
   }
 
-  // Per-screen generation status
-  type GenSummary = { id: number; status: string; videoLocalPath: string | null; updatedAt: number };
+  type GenSummary = { id: number; status: string; videoStoragePath: string | null; updatedAt: number };
   const latestGenByScreen = new Map<number, GenSummary>();
-  const latestCompletedLocalByScreen = new Map<number, { id: number; videoLocalPath: string }>();
+  const latestCompletedGenByScreen = new Map<number, { id: number; videoStoragePath: string }>();
 
   if (screenIds.length > 0) {
-    const allGens = db
+    const allGens = await db
       .select()
       .from(videoGenerations)
-      .where(inArray(videoGenerations.videoScreenId, screenIds))
-      .all()
-      .sort((a, b) => b.updatedAt - a.updatedAt);
+      .where(inArray(videoGenerations.videoScreenId, screenIds));
 
-    for (const gen of allGens) {
+    const sorted = allGens.sort((a, b) => b.updatedAt - a.updatedAt);
+    for (const gen of sorted) {
       if (!latestGenByScreen.has(gen.videoScreenId)) {
         latestGenByScreen.set(gen.videoScreenId, {
           id: gen.id,
           status: gen.status,
-          videoLocalPath: gen.videoLocalPath ?? null,
+          videoStoragePath: gen.videoStoragePath ?? null,
           updatedAt: gen.updatedAt,
         });
       }
       if (
         gen.status === 'completed' &&
-        gen.videoLocalPath &&
-        fs.existsSync(gen.videoLocalPath) &&
-        !latestCompletedLocalByScreen.has(gen.videoScreenId)
+        gen.videoStoragePath &&
+        !latestCompletedGenByScreen.has(gen.videoScreenId)
       ) {
-        latestCompletedLocalByScreen.set(gen.videoScreenId, {
+        latestCompletedGenByScreen.set(gen.videoScreenId, {
           id: gen.id,
-          videoLocalPath: gen.videoLocalPath,
+          videoStoragePath: gen.videoStoragePath,
         });
       }
     }
@@ -81,10 +77,17 @@ export async function GET(
     ...s,
     hasPrompt: promptPresence.get(s.id) ?? false,
     latestGen: latestGenByScreen.get(s.id) ?? null,
-    latestCompletedLocalGen: latestCompletedLocalByScreen.get(s.id) ?? null,
+    latestCompletedGen: latestCompletedGenByScreen.get(s.id) ?? null,
   }));
 
-  const baseImagePreviewUrl = `/api/v1/uploads/${path.basename(project.baseImagePath)}`;
+  // Generate signed URL for the base image preview
+  const { data: signedData } = await supabase.storage
+    .from(process.env.SUPABASE_BUCKET_UPLOADS ?? 'uploads')
+    .createSignedUrl(project.baseImagePath, 3600);
 
-  return NextResponse.json({ ...project, baseImagePreviewUrl, screens: enrichedScreens });
+  return NextResponse.json({
+    ...project,
+    baseImagePreviewUrl: signedData?.signedUrl ?? null,
+    screens: enrichedScreens,
+  });
 }

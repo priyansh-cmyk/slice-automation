@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/db';
-import { videoScreens, videoGenerations } from '@/db/schema';
+import { videoScreens, videoGenerations } from '@/db/schema.pg';
+import { createClient } from '@/lib/supabase/server';
 import { and, eq } from 'drizzle-orm';
-import * as fs from 'node:fs';
 
+// Returns a short-lived signed URL for a completed video generation.
 export async function GET(
   req: NextRequest,
   { params }: { params: Promise<{ id: string; n: string }> },
@@ -15,63 +16,56 @@ export async function GET(
     return NextResponse.json({ error: 'Invalid params' }, { status: 400 });
   }
 
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+
   const { searchParams } = new URL(req.url);
   const generationIdParam = searchParams.get('generationId');
 
-  const screen = db
+  const screenRows = await db
     .select()
     .from(videoScreens)
-    .where(
-      and(
-        eq(videoScreens.videoProjectId, projectId),
-        eq(videoScreens.screenNumber, screenNumber),
-      ),
-    )
-    .limit(1)
-    .get();
+    .where(and(eq(videoScreens.videoProjectId, projectId), eq(videoScreens.screenNumber, screenNumber)))
+    .limit(1);
+  const screen = screenRows[0];
   if (!screen) return NextResponse.json({ error: 'Screen not found' }, { status: 404 });
 
-  let generation = generationIdParam
-    ? db
-        .select()
-        .from(videoGenerations)
-        .where(
-          and(
-            eq(videoGenerations.id, parseInt(generationIdParam, 10)),
-            eq(videoGenerations.videoScreenId, screen.id),
-          ),
-        )
-        .limit(1)
-        .get()
-    : db
-        .select()
-        .from(videoGenerations)
-        .where(
-          and(
-            eq(videoGenerations.videoScreenId, screen.id),
-            eq(videoGenerations.status, 'completed'),
-          ),
-        )
-        .all()
-        .sort((a, b) => b.createdAt - a.createdAt)[0];
+  let generation: typeof videoGenerations.$inferSelect | undefined;
 
-  if (!generation || !generation.videoLocalPath) {
+  if (generationIdParam) {
+    const rows = await db
+      .select()
+      .from(videoGenerations)
+      .where(
+        and(
+          eq(videoGenerations.id, parseInt(generationIdParam, 10)),
+          eq(videoGenerations.videoScreenId, screen.id),
+        ),
+      )
+      .limit(1);
+    generation = rows[0];
+  } else {
+    const rows = await db
+      .select()
+      .from(videoGenerations)
+      .where(and(eq(videoGenerations.videoScreenId, screen.id), eq(videoGenerations.status, 'completed')));
+    generation = rows.sort((a, b) => b.createdAt - a.createdAt)[0];
+  }
+
+  if (!generation || !generation.videoStoragePath) {
     return NextResponse.json({ error: 'No completed video found' }, { status: 404 });
   }
 
-  const filePath = generation.videoLocalPath;
-  if (!fs.existsSync(filePath)) {
-    return NextResponse.json({ error: 'Video file not found on disk' }, { status: 404 });
+  const bucket = process.env.SUPABASE_BUCKET_VIDEOS ?? 'videos';
+  const { data, error } = await supabase.storage
+    .from(bucket)
+    .createSignedUrl(generation.videoStoragePath, 3600);
+
+  if (error || !data?.signedUrl) {
+    return NextResponse.json({ error: 'Failed to generate signed video URL' }, { status: 500 });
   }
 
-  const buffer = fs.readFileSync(filePath);
-  const ext = filePath.endsWith('.webm') ? 'webm' : 'mp4';
-  const contentType = ext === 'webm' ? 'video/webm' : 'video/mp4';
-
-  return new NextResponse(buffer, {
-    headers: {
-      'Content-Type': contentType,
-      'Content-Length': buffer.byteLength.toString(),
-    },
-  });
+  // Return the signed URL; the client fetches the video directly from Supabase CDN
+  return NextResponse.json({ signedUrl: data.signedUrl, generationId: generation.id });
 }

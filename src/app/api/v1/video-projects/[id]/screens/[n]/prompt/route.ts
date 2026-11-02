@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/db';
-import { videoProjects, videoScreens, screenPromptVersions } from '@/db/schema';
+import { videoScreens } from '@/db/schema.pg';
+import { createClient } from '@/lib/supabase/server';
 import { and, eq } from 'drizzle-orm';
 import {
   generateScreen1Prompt,
@@ -16,7 +17,6 @@ function getIds(idStr: string, nStr: string): { projectId: number; screenNumber:
   return { projectId, screenNumber };
 }
 
-// POST - Claude generates or revises prompt
 export async function POST(
   req: NextRequest,
   { params }: { params: Promise<{ id: string; n: string }> },
@@ -25,17 +25,16 @@ export async function POST(
   const ids = getIds(id, n);
   if (!ids) return NextResponse.json({ error: 'Invalid params' }, { status: 400 });
 
-  const screen = db
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const screenRows = await db
     .select()
     .from(videoScreens)
-    .where(
-      and(
-        eq(videoScreens.videoProjectId, ids.projectId),
-        eq(videoScreens.screenNumber, ids.screenNumber),
-      ),
-    )
-    .limit(1)
-    .get();
+    .where(and(eq(videoScreens.videoProjectId, ids.projectId), eq(videoScreens.screenNumber, ids.screenNumber)))
+    .limit(1);
+  const screen = screenRows[0];
   if (!screen) return NextResponse.json({ error: 'Screen not found' }, { status: 404 });
 
   const body = (await req.json().catch(() => ({}))) as {
@@ -46,28 +45,16 @@ export async function POST(
   let result: { promptText: string; version: number; validation: { issues: string[]; warnings: string[] }; feedbackScope?: string };
 
   if (ids.screenNumber === 1) {
-    result = await generateScreen1Prompt(
-      ids.projectId,
-      screen.id,
-      body.nlFeedback,
-      body.reviewingGenerationId,
-    );
+    result = await generateScreen1Prompt(ids.projectId, screen.id, body.nlFeedback, body.reviewingGenerationId);
   } else if (!body.nlFeedback) {
-    // Initial generation for screens 2+
     result = await generateInitialScreenPrompt(ids.projectId, screen.id);
   } else {
-    result = await revisePrompt(
-      ids.projectId,
-      screen.id,
-      body.nlFeedback,
-      body.reviewingGenerationId,
-    );
+    result = await revisePrompt(ids.projectId, screen.id, body.nlFeedback, body.reviewingGenerationId);
   }
 
   return NextResponse.json(result);
 }
 
-// PUT - manual edit
 export async function PUT(
   req: NextRequest,
   { params }: { params: Promise<{ id: string; n: string }> },
@@ -76,17 +63,16 @@ export async function PUT(
   const ids = getIds(id, n);
   if (!ids) return NextResponse.json({ error: 'Invalid params' }, { status: 400 });
 
-  const screen = db
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const screenRows = await db
     .select()
     .from(videoScreens)
-    .where(
-      and(
-        eq(videoScreens.videoProjectId, ids.projectId),
-        eq(videoScreens.screenNumber, ids.screenNumber),
-      ),
-    )
-    .limit(1)
-    .get();
+    .where(and(eq(videoScreens.videoProjectId, ids.projectId), eq(videoScreens.screenNumber, ids.screenNumber)))
+    .limit(1);
+  const screen = screenRows[0];
   if (!screen) return NextResponse.json({ error: 'Screen not found' }, { status: 404 });
 
   const body = (await req.json()) as { promptText: string };

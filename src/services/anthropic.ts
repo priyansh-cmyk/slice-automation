@@ -1,9 +1,8 @@
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import Anthropic from '@anthropic-ai/sdk';
 import type { MessageParam } from '@anthropic-ai/sdk/resources/messages';
+import { createClient } from '@supabase/supabase-js';
 import { db } from '@/db';
-import { claudeConversations } from '@/db/schema';
+import { claudeConversations } from '@/db/schema.pg';
 import { and, eq, isNull } from 'drizzle-orm';
 
 const MODEL = () => process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-5-5';
@@ -18,11 +17,11 @@ function getClient(): Anthropic {
 }
 
 const SUPPORTED_IMAGE_TYPES = {
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.png': 'image/png',
-  '.gif': 'image/gif',
-  '.webp': 'image/webp',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  gif: 'image/gif',
+  webp: 'image/webp',
 } as const;
 
 type SupportedMimeType = (typeof SUPPORTED_IMAGE_TYPES)[keyof typeof SUPPORTED_IMAGE_TYPES];
@@ -32,35 +31,43 @@ export interface EncodedImage {
   mimeType: SupportedMimeType;
 }
 
-export function encodeImageFromPath(imagePath: string): EncodedImage {
-  if (!fs.existsSync(imagePath)) {
-    throw new Error(`Reference image not found: ${imagePath}`);
+/**
+ * Downloads a file from Supabase Storage and encodes it as base64 for Claude.
+ * storagePath: the path stored in the DB, e.g. "uploads/my-image.jpg"
+ * bucket: the Supabase Storage bucket name
+ */
+export async function encodeImageFromStorage(storagePath: string, bucket: string): Promise<EncodedImage> {
+  const supabase = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    { auth: { persistSession: false } },
+  );
+
+  const { data, error } = await supabase.storage.from(bucket).download(storagePath);
+  if (error || !data) {
+    throw new Error(`Failed to download ${storagePath} from bucket ${bucket}: ${error?.message}`);
   }
-  const ext = path.extname(imagePath).toLowerCase() as keyof typeof SUPPORTED_IMAGE_TYPES;
-  const mimeType = SUPPORTED_IMAGE_TYPES[ext];
-  if (!mimeType) {
-    throw new Error(
-      `Unsupported image format "${ext}" at ${imagePath}. Supported: jpg, png, gif, webp`,
-    );
-  }
-  const data = fs.readFileSync(imagePath);
-  return { base64: data.toString('base64'), mimeType };
+
+  const ext = storagePath.split('.').pop()?.toLowerCase() ?? '';
+  const mimeType = SUPPORTED_IMAGE_TYPES[ext as keyof typeof SUPPORTED_IMAGE_TYPES] ?? 'image/jpeg';
+  const arrayBuffer = await data.arrayBuffer();
+  const base64 = Buffer.from(arrayBuffer).toString('base64');
+  return { base64, mimeType };
 }
 
 export async function loadConversation(
   videoProjectId: number,
   videoScreenId?: number,
 ): Promise<MessageParam[]> {
-  let row;
+  let rows;
   if (videoScreenId) {
-    row = db
+    rows = await db
       .select()
       .from(claudeConversations)
       .where(eq(claudeConversations.videoScreenId, videoScreenId))
-      .limit(1)
-      .get();
+      .limit(1);
   } else {
-    row = db
+    rows = await db
       .select()
       .from(claudeConversations)
       .where(
@@ -69,9 +76,9 @@ export async function loadConversation(
           isNull(claudeConversations.videoScreenId),
         ),
       )
-      .limit(1)
-      .get();
+      .limit(1);
   }
+  const row = rows[0];
   if (!row) return [];
   return JSON.parse(row.messagesJson) as MessageParam[];
 }
@@ -84,14 +91,14 @@ export async function saveConversation(
   const now = Date.now();
   let existing;
   if (videoScreenId) {
-    existing = db
+    const rows = await db
       .select()
       .from(claudeConversations)
       .where(eq(claudeConversations.videoScreenId, videoScreenId))
-      .limit(1)
-      .get();
+      .limit(1);
+    existing = rows[0];
   } else {
-    existing = db
+    const rows = await db
       .select()
       .from(claudeConversations)
       .where(
@@ -100,27 +107,27 @@ export async function saveConversation(
           isNull(claudeConversations.videoScreenId),
         ),
       )
-      .limit(1)
-      .get();
+      .limit(1);
+    existing = rows[0];
   }
 
   const json = JSON.stringify(messages);
   if (existing) {
-    db.update(claudeConversations)
+    await db
+      .update(claudeConversations)
       .set({ messagesJson: json, updatedAt: now })
-      .where(eq(claudeConversations.id, existing.id))
-      .run();
+      .where(eq(claudeConversations.id, existing.id));
   } else {
-    db.insert(claudeConversations)
-      .values({ videoProjectId, videoScreenId: videoScreenId ?? null, messagesJson: json, updatedAt: now })
-      .run();
+    await db
+      .insert(claudeConversations)
+      .values({ videoProjectId, videoScreenId: videoScreenId ?? null, messagesJson: json, updatedAt: now });
   }
 }
 
 export interface CallClaudeOptions {
   videoScreenId?: number;
   fresh?: boolean;
-  image?: EncodedImage; // pre-encoded to avoid re-reading when calling in a loop
+  image?: EncodedImage;
 }
 
 export async function callClaude(
@@ -133,7 +140,6 @@ export async function callClaude(
 
   const history = fresh ? [] : await loadConversation(videoProjectId, videoScreenId);
 
-  // Build user content: image block first (if provided), then text
   const userContent: MessageParam['content'] = image
     ? [
         {

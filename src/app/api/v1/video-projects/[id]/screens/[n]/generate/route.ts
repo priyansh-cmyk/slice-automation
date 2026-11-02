@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/db';
-import { videoScreens, videoGenerations } from '@/db/schema';
+import { videoScreens, videoGenerations } from '@/db/schema.pg';
+import { createClient } from '@/lib/supabase/server';
 import { and, eq } from 'drizzle-orm';
 import { submitVideoGeneration } from '@/services/video-workflow';
 import { AuthenticationError, ConfigurationError, UnexpectedProviderError } from '@/providers/useapi/errors';
@@ -16,17 +17,16 @@ export async function POST(
     return NextResponse.json({ error: 'Invalid params' }, { status: 400 });
   }
 
-  const screen = db
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const screenRows = await db
     .select()
     .from(videoScreens)
-    .where(
-      and(
-        eq(videoScreens.videoProjectId, projectId),
-        eq(videoScreens.screenNumber, screenNumber),
-      ),
-    )
-    .limit(1)
-    .get();
+    .where(and(eq(videoScreens.videoProjectId, projectId), eq(videoScreens.screenNumber, screenNumber)))
+    .limit(1);
+  const screen = screenRows[0];
   if (!screen) return NextResponse.json({ error: 'Screen not found' }, { status: 404 });
 
   const body = (await req.json()) as { promptVersionId: number; creatorFeedback?: string; durationOverride?: number };
@@ -54,12 +54,11 @@ export async function POST(
     return NextResponse.json({ error: 'An unexpected error occurred during video generation.' }, { status: 500 });
   }
 
-  // Store feedback against the generation record immediately after creation
   if (body.creatorFeedback) {
-    db.update(videoGenerations)
+    await db
+      .update(videoGenerations)
       .set({ creatorFeedback: body.creatorFeedback, updatedAt: Date.now() })
-      .where(eq(videoGenerations.id, result.generationId))
-      .run();
+      .where(eq(videoGenerations.id, result.generationId));
   }
 
   return NextResponse.json(result, { status: 201 });
