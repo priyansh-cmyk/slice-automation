@@ -1,9 +1,10 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import AppShell from '@/components/AppShell';
+import FeedbackModal from '@/components/FeedbackModal';
 
 interface PromptVersion {
   id: number;
@@ -19,7 +20,7 @@ interface Generation {
     id: number;
     status: string;
     jobId: string | null;
-    videoLocalPath: string | null;
+    videoStoragePath: string | null;
     durationSeconds: number | null;
     createdAt: number;
   };
@@ -86,11 +87,23 @@ export default function ScreenPage() {
   const [showHistory, setShowHistory] = useState(false);
   const [validation, setValidation] = useState<{ issues: string[]; warnings: string[] } | null>(null);
   const [projectScopePending, setProjectScopePending] = useState(false);
+  const [signedVideoUrls, setSignedVideoUrls] = useState<Record<number, string>>({});
+  const [feedbackGenId, setFeedbackGenId] = useState<number | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   function isProjectScopeFeedback(text: string): boolean {
     return /across all scenes|throughout|in every scene|all scenes|his voice throughout|her voice throughout|the whole project|project.wide|consistently|every scene/i.test(text);
   }
+
+  const fetchSignedUrl = useCallback(async (generationId: number) => {
+    if (signedVideoUrls[generationId]) return;
+    try {
+      const res = await fetch(`/api/v1/video-projects/${id}/screens/${n}/video?generationId=${generationId}`);
+      if (!res.ok) return;
+      const { signedUrl } = await res.json() as { signedUrl: string };
+      setSignedVideoUrls((prev) => ({ ...prev, [generationId]: signedUrl }));
+    } catch { /* will retry on next render */ }
+  }, [id, n, signedVideoUrls]);
 
   async function loadAll() {
     const [projRes, histRes, genRes] = await Promise.all([
@@ -570,8 +583,10 @@ export default function ScreenPage() {
                 {!hasPending && hasReadyVideo && (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
                     {generations.map(({ generation: g, promptVersion: pv }, idx) => {
-                      if (g.status !== 'completed' || !g.videoLocalPath) return null;
+                      if (g.status !== 'completed' || !g.videoStoragePath) return null;
                       const thisIsApproved = g.id === screen?.approvedGenerationId;
+                      // Kick off signed URL fetch on first render of this generation
+                      if (!signedVideoUrls[g.id]) { void fetchSignedUrl(g.id); }
                       return (
                         <div key={g.id} className="card">
                           <div className="card-header">
@@ -594,10 +609,11 @@ export default function ScreenPage() {
                           </div>
                           <div className="card-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                             <div className="video-result">
-                              <video
-                                src={`/api/v1/video-projects/${id}/screens/${n}/video?generationId=${g.id}`}
-                                controls
-                              />
+                              {signedVideoUrls[g.id] ? (
+                                <video src={signedVideoUrls[g.id]} controls />
+                              ) : (
+                                <div className="skeleton" style={{ height: 200, borderRadius: 8 }} />
+                              )}
                             </div>
                             {!isApproved && (
                               <div className="action-well">
@@ -638,7 +654,23 @@ export default function ScreenPage() {
                                       {submitting ? 'Generating…' : `Regenerate at ${d}s`}
                                     </button>
                                   ))}
+                                  <button
+                                    className="btn btn-secondary"
+                                    onClick={() => setFeedbackGenId(g.id)}
+                                  >
+                                    Rate this clip
+                                  </button>
                                 </div>
+                              </div>
+                            )}
+                            {thisIsApproved && (
+                              <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                                <button
+                                  className="btn btn-secondary btn-sm"
+                                  onClick={() => setFeedbackGenId(g.id)}
+                                >
+                                  Rate this clip
+                                </button>
                               </div>
                             )}
                             {thisIsApproved && nextScreen && (
@@ -698,6 +730,14 @@ export default function ScreenPage() {
           </div>
         </div>
       </div>
+
+      {feedbackGenId != null && (
+        <FeedbackModal
+          videoGenerationId={feedbackGenId}
+          videoProjectId={project?.id}
+          onClose={() => setFeedbackGenId(null)}
+        />
+      )}
     </AppShell>
   );
 }
