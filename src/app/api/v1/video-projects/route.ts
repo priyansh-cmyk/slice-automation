@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/db';
-import { videoProjects } from '@/db/schema.pg';
+import { adminSettings, videoProjects } from '@/db/schema.pg';
 import { createClient } from '@/lib/supabase/server';
 import { desc, eq } from 'drizzle-orm';
 
@@ -29,7 +29,6 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     baseImagePath: string;
     skillVersion?: string;
     creatorDescription?: string;
-    scene1HookSnapshot?: string;
   };
 
   if (!body.name || !body.originalScript) {
@@ -38,6 +37,10 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   if (!body.baseImagePath) {
     return NextResponse.json({ error: 'baseImagePath is required' }, { status: 400 });
   }
+
+  // Snapshot the current scene1HookInstruction at creation time
+  const settingsRows = await db.select().from(adminSettings).where(eq(adminSettings.id, 1)).limit(1);
+  const scene1HookSnapshot = settingsRows[0]?.scene1HookInstruction ?? null;
 
   const now = Date.now();
   const inserted = await db
@@ -49,7 +52,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       originalScript: body.originalScript,
       skillVersion: body.skillVersion ?? 'v1',
       creatorDescription: body.creatorDescription?.trim() || null,
-      scene1HookSnapshot: body.scene1HookSnapshot ?? null,
+      scene1HookSnapshot,
       createdAt: now,
       updatedAt: now,
     })
