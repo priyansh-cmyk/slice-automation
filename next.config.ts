@@ -1,8 +1,8 @@
 import type { NextConfig } from 'next';
 
 const nextConfig: NextConfig = {
-  // better-sqlite3 is a native Node.js module — never bundle it
-  serverExternalPackages: ['better-sqlite3'],
+  // postgres and ffmpeg-static must not be bundled by webpack
+  serverExternalPackages: ['postgres', 'ffmpeg-static'],
 };
 
 export default nextConfig;
