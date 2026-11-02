@@ -3,6 +3,7 @@ import dotenv from 'dotenv';
 dotenv.config({ path: path.resolve(process.cwd(), '.env.local') });
 
 import { acquireLock, releaseLock, closeLockConnection } from './lock';
+import { processPendingCompilation, recoverStaleCompilations } from './compilation';
 import { validateEnv } from '../lib/startup-checks';
 import { db } from '../db';
 import {
@@ -41,6 +42,7 @@ async function main(): Promise<void> {
   process.on('SIGINT',  () => shutdown('SIGINT'));
 
   await recoverStaleTasks();
+  await recoverStaleCompilations();
   await runLoop();
 }
 
@@ -89,6 +91,7 @@ async function tick(): Promise<void> {
   if (process.env.MOCK_USEAPI === 'true') return;
 
   await pollInFlightGenerations();
+  await processPendingCompilation();
 }
 
 async function processPromptTasks(): Promise<void> {
