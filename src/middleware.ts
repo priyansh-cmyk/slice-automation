@@ -1,24 +1,18 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { type NextRequest } from 'next/server';
+import { updateSession } from '@/lib/supabase/middleware';
 
-export function middleware(request: NextRequest): NextResponse {
-  const origin = request.headers.get('origin');
-
-  if (origin) {
-    let originHostname: string;
-    try {
-      originHostname = new URL(origin).hostname;
-    } catch {
-      return NextResponse.json({ error: 'Bad Request' }, { status: 400 });
-    }
-
-    if (originHostname !== 'localhost' && originHostname !== '127.0.0.1') {
-      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
-    }
-  }
-
-  return NextResponse.next();
+export async function middleware(request: NextRequest) {
+  return updateSession(request);
 }
 
 export const config = {
-  matcher: '/api/:path*',
+  matcher: [
+    /*
+     * Match all request paths EXCEPT:
+     * - _next/static  (Next.js static files)
+     * - _next/image   (Next.js image optimization)
+     * - favicon.ico, sitemap.xml, robots.txt
+     */
+    '/((?!_next/static|_next/image|favicon.ico|sitemap.xml|robots.txt).*)',
+  ],
 };
